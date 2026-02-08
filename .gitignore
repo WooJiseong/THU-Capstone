@@ -1,6 +1,5 @@
---- Python & System ---
-
-pycache/
+# --- Python & System ---
+__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -8,23 +7,29 @@ pycache/
 .ipynb_checkpoints/
 .DS_Store
 
---- Virtual Environment (UV) ---
-
+# --- Virtual Environment (UV) ---
 .venv/
 
---- Secrets & Security ---
-
+# --- Secrets & Security ---
 src/api/mistral_api.txt
+src/mistral_api.txt
 .env
 secret_*.txt
+*.pem
 
---- Logs ---
-
+# --- Logs & Tracking ---
 wandb/
 .wandb/
 *.log
 
---- IDE & Editors ---
+# --- Machine Learning Specific ---
+data/raw/
+data/processed/
+*.pt
+*.pth
+*.bin
+models/checkpoints/
 
+# --- IDE & Editors ---
 .vscode/
 .idea/
