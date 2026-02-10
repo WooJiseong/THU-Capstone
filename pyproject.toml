@@ -21,6 +21,8 @@ dependencies = [
     "ipykernel>=7.2.0",
     "matplotlib>=3.10.8",
     "seaborn>=0.13.2",
+    "pymupdf>=1.26.7",
+    "sentence-transformers>=5.2.2",
 ]
 
 [dependency-groups]

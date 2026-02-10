@@ -1,0 +1,30 @@
+experiments:
+  - name: "EU AI Act Analysis"
+    source_files:
+      - "data/aiact.txt"
+    queries:
+      - "How many articles are there in the AI Act?"
+      - "Summarize the requirements for high-risk AI systems."
+      - "What are the prohibited AI practices according to Article 5?"
+
+  - name: "EU National Parks File"
+    source_files:
+      - "data/nationalparks_europe.txt"
+    queries:
+      - "List me all national parks sorted by their highest Point?"
+      - "List me all national parks where I can see brown bears"
+      - "Give me a table of all the national parks in scandinavia and the Country they are in"
+
+  - name: "VMware Documentation"
+    source_files:
+      - "data/vmware.txt"
+    queries:
+      - "List the differences of the 3q, 3s and 3m release in a table."
+      - "List me a timeline for when each version of the Vmware vCenter was released."
+
+  - name: "AI Act + Top generative use case"
+    source_files:
+      - "data/aiact.txt"
+      - "data/top_generative_use_cases.txt"
+    queries:
+      - "Given a virtual ai assistant in the healthcare domain, go through all articles of the ai act regulations and tell me which are noteworthy for the use-case."
