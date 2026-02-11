@@ -1,200 +1,201 @@
 import time
+import os
+import pickle
+import yaml
 import numpy as np
 import concurrent.futures
-from typing import List, Dict, Any, Optional
+import multiprocessing
+from typing import List, Dict, Any, Tuple
+
+import torch
+from tqdm import tqdm
 from sentence_transformers import util
+
 from src.api.client import MistralAPIClient
-from src.data_loader.preprocessor import GeneralMarkdownPreprocessor
+from src.data_loader.preprocessor import FastLongContextPreprocessor
 from src.utils.logger import ExperimentLogger
 
 class WorkflowOrchestrator:
     """
-    Enhanced RAPTOR-inspired Two-Way Orchestrator.
-    Fuses structured global context with high-fidelity raw tokens using 
-    explicit delimiters and multi-step reasoning prompts.
+    Planner-Navigator-Executor 구조를 가진 에이전트형 오케스트레이터입니다.
+    대규모 문서의 임베딩 캐싱 및 병렬 처리를 통해 성능을 최적화합니다.
     """
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.client = MistralAPIClient()
         
+        # 1. 프롬프트 YAML 로드
+        self.prompts = self._load_yaml_prompts("configs/prompts.yaml")
+        
+        # 2. 전처리기 설정
         data_cfg = config.get('data', {})
-        self.preprocessor = GeneralMarkdownPreprocessor(
+        self.preprocessor = FastLongContextPreprocessor(
             max_tokens=data_cfg.get('chunk_size', 5000),
             overlap=data_cfg.get('overlap', 1000)
         )
-        
+
+        # 3. 임베딩 및 전략 설정
+        self.batch_size = data_cfg.get('batch_size', 128)
         self.logger = ExperimentLogger()
-        self.exp_name = config.get('experiment_name', 'structured_hybrid_v2')
+        self.exp_name = config.get('experiment_name', 'agentic_long_context_v1')
         
         strat_cfg = config.get('strategy', {})
-        self.landmark_top_n = strat_cfg.get('scan_top_n', 50)
-        self.evidence_top_k = strat_cfg.get('final_top_k', 12)
+        self.landmark_top_n = strat_cfg.get('scan_top_n', 40)
+        self.evidence_top_k = strat_cfg.get('final_top_k', 10)
         
-        self._doc_cache: Dict[str, Any] = {
-            "text_hash": None,
-            "embeddings": None,
-            "chunks": None
-        }
+        # 4. 캐시 경로 설정
+        self.cache_dir = "data/cache"
+        os.makedirs(self.cache_dir, exist_ok=True)
 
-    def _get_embeddings(self, chunks: List[Dict[str, Any]], raw_text: str) -> np.ndarray:
-        text_hash = hash(raw_text)
-        if self._doc_cache["text_hash"] == text_hash and self._doc_cache["embeddings"] is not None:
-            return self._doc_cache["embeddings"]
+    def _load_yaml_prompts(self, path: str) -> Dict[str, Any]:
+        """YAML 설정 파일에서 프롬프트 템플릿을 로드합니다."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"프롬프트 설정 파일을 찾을 수 없습니다: {path}")
+        with open(path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
 
-        print(f"[*] Vectorizing {len(chunks)} chunks for semantic retrieval...")
+    def _get_cache_path(self, file_name: str) -> str:
+        """파일명 기반 안전한 캐시 경로 생성"""
+        safe_name = "".join([c if c.isalnum() else "_" for c in file_name])
+        return os.path.join(self.cache_dir, f"{safe_name}_v2.pkl")
+
+    def _get_embeddings(self, chunks: List[Dict[str, Any]], file_name: str) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        """
+        임베딩 생성 가속 및 로컬 디스크 캐싱 로직.
+        반환 타입: tuple(임베딩 배열, 청크 리스트)
+        """
+        cache_path = self._get_cache_path(file_name)
+        
+        # 1. 로컬 캐시 확인
+        if os.path.exists(cache_path):
+            print(f"[*] 로컬 캐시 발견: {cache_path} 로드 중...")
+            try:
+                with open(cache_path, "rb") as f:
+                    cached_data = pickle.load(f)
+                    return cached_data["embeddings"], cached_data["chunks"]
+            except Exception as e:
+                print(f"[!] 캐시 로드 실패, 재생성합니다: {e}")
+
+        # 2. 임베딩 생성 시작
+        print(f"[*] 인베딩 생성 중: {len(chunks)} 청크 분석...")
         chunk_contents = [c['content'] for c in chunks]
-        embeddings = self.client.st_model.encode(
-            chunk_contents, 
-            convert_to_tensor=True, 
-            show_progress_bar=True,
-            batch_size=64
-        )
         
-        emb_np = embeddings.cpu().numpy()
-        self._doc_cache.update({"text_hash": text_hash, "embeddings": emb_np, "chunks": chunks})
-        return emb_np
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        
+        if device == "cpu":
+            print(f"[*] CPU 멀티프로세스 가속 모드 가동 (Workers: {multiprocessing.cpu_count()-1})")
+            pool = self.client.st_model.start_multi_process_pool()
+            emb_np = self.client.st_model.encode_multi_process(
+                chunk_contents, pool, batch_size=self.batch_size
+            )
+            self.client.st_model.stop_multi_process_pool(pool)
+        else:
+            print(f"[*] 가속 장치 가동: {device}")
+            embeddings = self.client.st_model.encode(
+                chunk_contents, 
+                convert_to_tensor=True, 
+                show_progress_bar=True,
+                batch_size=self.batch_size,
+                device=device
+            )
+            emb_np = embeddings.cpu().numpy()
 
-    def _create_scout_landmark(self, chunk: Dict[str, Any], query: str) -> Dict[str, Any]:
-        """
-        [Step 1: Global Scouting] 
-        Produces a structured summary of the segment's role and boundaries.
-        """
-        landmark_prompt = (
-            "### TASK: STRUCTURAL LANDMARK EXTRACTION\n"
-            "Analyze the following segment to provide context for the query: '{query}'\n\n"
-            "--- SEGMENT START ---\n{content}\n--- SEGMENT END ---\n\n"
-            "Respond in the following format:\n"
-            "RELEVANCE_SCORE: [0-10]\n"
-            "SEQ_MARKERS: [List all sequential IDs like Article numbers, Version tags, or Dates]\n"
-            "TERMINAL_MARKER: [The very last ID or number in this segment]\n"
-            "CONTENT_BRIEF: [1-sentence technical summary]"
-        )
+        # 3. 결과 캐싱
+        with open(cache_path, "wb") as f:
+            pickle.dump({"embeddings": emb_np, "chunks": chunks}, f)
+        
+        return emb_np, chunks
+
+    def _create_search_plan(self, query: str) -> str:
+        """Step 1: Planner - 질문 분석 및 탐색 전략 수립"""
+        template = self.prompts['planner']['user']
+        system_msg = self.prompts['planner']['system']
+        
+        return self.client.chat_completion([
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": template.format(query=query)}
+        ], temperature=0.0)
+
+    def _scout_location(self, chunk: Dict[str, Any], plan: str, query: str) -> Dict[str, Any]:
+        """Step 2: Navigator - 개별 청크의 가치 평가 및 증거 추출"""
+        template = self.prompts['navigator']['user']
+        system_msg = self.prompts['navigator']['system']
+        
+        content = chunk['content'][:3500]  # 컨텍스트 길이 최적화
         
         response = self.client.chat_completion([
-            {"role": "user", "content": landmark_prompt.format(query=query, content=chunk['content'][:3500])}
-        ], temperature=0.0, max_tokens=250)
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": template.format(plan=plan, query=query, content=content)}
+        ], temperature=0.0, max_tokens=300)
         
-        score = 0
-        if "RELEVANCE_SCORE:" in response:
+        score = 5
+        if "VALUE_SCORE:" in response:
             try:
-                score_part = response.split("RELEVANCE_SCORE:")[1].split("\n")[0].strip()
+                score_part = response.split("VALUE_SCORE:")[1].split("\n")[0]
                 score = int(''.join(filter(str.isdigit, score_part)))
-            except: score = 5
+            except: pass
             
         return {
-            "landmark": response,
-            "score": score,
-            "content": chunk['content'],
+            "score": score, 
+            "findings": response, 
+            "content": chunk['content'], 
             "metadata": chunk['metadata']
         }
 
-    def _synthesize_hybrid_results(self, query: str, scout_results: List[Dict[str, Any]], total_chunks: int) -> str:
-        """
-        [Step 3: Purpose-Driven Synthesis] 
-        Fuses Global Map and Raw Evidence using distinct delimiters.
-        """
-        # Select best raw evidence
-        sorted_results = sorted(scout_results, key=lambda x: x['score'], reverse=True)
-        evidence_chunks = [r for r in sorted_results[:self.evidence_top_k] if r['score'] >= 4]
+    def _execute_synthesis(self, query: str, plan: str, top_findings: List[Dict[str, Any]]) -> str:
+        """Step 3: Executor - 수집된 증거를 종합하여 최종 답변 작성"""
+        template = self.prompts['synthesis']['user']
+        system_msg = self.prompts['synthesis']['system']
         
-        # Build generalized structural map
-        map_indices = set()
-        map_indices.add(0) # Document Head
-        map_indices.add(total_chunks - 1) # Document Tail
-        for i, res in enumerate(scout_results):
-            if res['score'] >= 7: map_indices.add(i)
-        
-        sample_rate = max(1, total_chunks // 10)
-        for i in range(0, total_chunks, sample_rate): map_indices.add(i)
+        evidence_str = ""
+        for i, f in enumerate(top_findings):
+            loc = " > ".join(f['metadata'].get('hierarchy', ['Root']))
+            evidence_str += f"<SOURCE index='{i+1}' location='{loc}'>\n{f['content']}\n</SOURCE>\n\n"
 
-        sorted_map_indices = sorted(list(map_indices))
-        map_entries = []
-        for idx in sorted_map_indices:
-            res = scout_results[idx]
-            map_entries.append(f"<CHUNK_POSITION index='{idx+1}/{total_chunks}'>\n{res['landmark']}\n</CHUNK_POSITION>")
-        
-        global_map_str = "\n".join(map_entries)
-        
-        evidence_blocks = []
-        for i, ev in enumerate(evidence_chunks):
-            loc = " > ".join(ev['metadata'].get('breadcrumbs', ['Root']))
-            evidence_blocks.append(
-                f"<RAW_EVIDENCE_BLOCK source='{loc}' rank='{i+1}'>\n{ev['content']}\n</RAW_EVIDENCE_BLOCK>"
-            )
-        detailed_evidence_str = "\n".join(evidence_blocks)
-
-        final_prompt = (
-            "### ROLE: SENIOR TECHNICAL AUDITOR\n"
-            "You are provided with two distinct layers of information to answer the query: '{query}'\n\n"
-            
-            "--- LAYER 1: GLOBAL_STRUCTURE_MAP ---\n"
-            "Use this to understand the sequence, flow, and boundaries of the entire document.\n"
-            "<GLOBAL_STRUCTURE_MAP>\n{global_map}\n</GLOBAL_STRUCTURE_MAP>\n\n"
-            
-            "--- LAYER 2: TARGETED_RAW_EVIDENCE ---\n"
-            "Use this for high-precision extraction of facts, technical specs, and literal quotes.\n"
-            "<TARGETED_RAW_EVIDENCE>\n{evidence}\n</TARGETED_RAW_EVIDENCE>\n\n"
-            
-            "### REASONING PROTOCOL:\n"
-            "1. **Analyze Sequence**: Trace the progression of identifiers (Articles, Versions, IDs) in the GLOBAL_STRUCTURE_MAP.\n"
-            "2. **Find Terminal Points**: To identify the total count or the final version, look at the very last CHUNK_POSITION entry.\n"
-            "3. **Extract Facts**: Cross-reference the identifiers with the TARGETED_RAW_EVIDENCE to find the specific values required.\n"
-            "4. **Synthesize**: Merge the structural context with the raw data. If a table or list is requested, format it clearly.\n"
-            "5. **Verify**: Ensure the answer is strictly derived from the provided tags. Cite chunk positions for traceability.\n\n"
-            "FINAL RESPONSE:"
-        )
-        
         return self.client.chat_completion([
-            {"role": "user", "content": final_prompt.format(
-                query=query, global_map=global_map_str, evidence=detailed_evidence_str
-            )}
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": template.format(query=query, plan=plan, evidence=evidence_str)}
         ], max_tokens=2500)
 
     def run_pipeline(self, raw_text: str, query: str, file_name: str) -> str:
+        """에이전트 파이프라인 통합 실행 메인 메서드"""
         start_time = time.time()
         
-        # Cache-aware Preprocessing
-        text_hash = hash(raw_text)
-        if self._doc_cache["text_hash"] == text_hash and self._doc_cache["chunks"]:
-            chunks = self._doc_cache["chunks"]
+        # 1. 캐시 확인 및 전처리
+        cache_path = self._get_cache_path(file_name)
+        if os.path.exists(cache_path):
+            chunks = []  # 임베딩 함수 내에서 캐시 로드됨
         else:
             chunks = self.preprocessor.preprocess(raw_text, {"file_name": file_name})
         
-        print(f"[*] Initiating structured hybrid analysis: {file_name} ({len(chunks)} chunks)")
-
-        # 1. Similarity-based Pruning
-        embeddings = self._get_embeddings(chunks, raw_text)
-        query_emb = self.client.st_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
+        # 2. 임베딩 가속 로드
+        embeddings, chunks = self._get_embeddings(chunks, file_name)
+        
+        # 3. 에이전트 플래닝
+        plan = self._create_search_plan(query)
+        print(f"[*] 탐색 계획 수립 완료: {plan[:80]}...")
+        
+        # 4. 후보군 선별 (Cosine Similarity)
+        query_emb = self.client.st_model.encode(query, convert_to_tensor=True)
         scores = util.cos_sim(query_emb, embeddings)[0].cpu().numpy()
         
         top_indices = np.argsort(-scores)[:self.landmark_top_n]
-        all_scout_results: List[Optional[Dict[str, Any]]] = [None] * len(chunks)
-        scout_indices = set(top_indices) | {0, len(chunks) - 1}
+        scout_indices = sorted(list(set(top_indices) | {0, len(chunks) - 1}))
         
-        # 2. Parallel Scouting (The "Forest" Layer)
-        print(f"[*] Scouting {len(scout_indices)} key structural landmarks...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_idx = {executor.submit(self._create_scout_landmark, chunks[idx], query): idx for idx in scout_indices}
-            for future in concurrent.futures.as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                all_scout_results[idx] = future.result()
+        # 5. 에이전트 내비게이션 (Parallel Scouting)
+        scout_results = []
+        print(f"[*] {len(scout_indices)}개 위치에 대한 에이전트 스카우팅 개시...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            future_to_idx = {
+                executor.submit(self._scout_location, chunks[idx], plan, query): idx 
+                for idx in scout_indices
+            }
+            for future in tqdm(concurrent.futures.as_completed(future_to_idx), total=len(scout_indices), desc="Scouting"):
+                scout_results.append(future.result())
 
-        # Fill metadata for unscouted chunks to preserve document map integrity
-        final_scout_results: List[Dict[str, Any]] = []
-        for i in range(len(chunks)):
-            res = all_scout_results[i]
-            if res is None:
-                loc = " > ".join(chunks[i]['metadata'].get('breadcrumbs', ['Unknown Section']))
-                final_scout_results.append({
-                    "landmark": f"RELEVANCE_SCORE: {round(float(scores[i])*10, 1)}\nSEQ_MARKERS: N/A\nCONTENT_BRIEF: Static marker for section {loc}",
-                    "score": float(scores[i]) * 4,
-                    "content": chunks[i]['content'],
-                    "metadata": chunks[i]['metadata']
-                })
-            else:
-                final_scout_results.append(res)
-
-        # 3. Final Synthesis (The Fusion Layer)
-        final_answer = self._synthesize_hybrid_results(query, final_scout_results, len(chunks))
+        # 6. 증거 기반 최종 합성
+        top_findings = sorted(scout_results, key=lambda x: x['score'], reverse=True)[:self.evidence_top_k]
+        final_answer = self._execute_synthesis(query, plan, top_findings)
+        
         self.logger.log_result(self.exp_name, query, final_answer, start_time, [file_name])
         return final_answer

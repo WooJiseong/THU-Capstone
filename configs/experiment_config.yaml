@@ -1,10 +1,11 @@
 data:
-  chunk_size: 5000   # 16000에서 6000으로 하향 (정보 밀도 향상)
+  chunk_size: 3000   # 16000에서 6000으로 하향 (정보 밀도 향상)
   overlap: 1000      # 문맥 끊김 방지를 위한 충분한 오버랩
+  batch_size: 256
 
 strategy:
-  scan_top_n: 40     # 청크가 작아졌으므로 더 많은 후보를 스캔
-  final_top_k: 8     # 더 많은 세부 증거 포함
+  scan_top_n: 80     # 청크가 작아졌으므로 더 많은 후보를 스캔
+  final_top_k: 16     # 더 많은 세부 증거 포함
 
 logging:
   base_path: "results"
