@@ -1,4 +1,11 @@
 experiments:
+  - name: "VMware Documentation"
+    source_files:
+      - "data/vmware.txt"
+    queries:
+      - "List the differences of the 3q, 3s and 3m release in a table."
+      - "List me a timeline for when each version of the Vmware vCenter was released."
+
   - name: "EU AI Act Analysis"
     source_files:
       - "data/aiact.txt"
@@ -14,13 +21,6 @@ experiments:
       - "List me all national parks sorted by their highest Point?"
       - "List me all national parks where I can see brown bears"
       - "Give me a table of all the national parks in scandinavia and the Country they are in"
-
-  - name: "VMware Documentation"
-    source_files:
-      - "data/vmware.txt"
-    queries:
-      - "List the differences of the 3q, 3s and 3m release in a table."
-      - "List me a timeline for when each version of the Vmware vCenter was released."
 
   - name: "AI Act + Top generative use case"
     source_files:

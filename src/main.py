@@ -1,89 +1,68 @@
+import yaml
 import os
-import sys
-import time
-import yaml  # pip install pyyaml 필요
+from typing import Dict, Any
+from src.core.orchestrator import WorkflowOrchestrator
 
-# 프로젝트 루트 경로 설정
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+def load_yaml(path: str) -> Dict[str, Any]:
+    """YAML 파일을 안전하게 로드합니다."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
 
-from src.core.model_manager import ModelManager
-from src.data_loader.preprocessor import DocumentPreprocessor
-from src.data_loader.indexer import GlobalIndexer
-from src.core.orchestrator import LongContextOrchestrator
-from src.utils.logger import ExperimentLogger  # 분리한 로거 모듈
-
-def run_experiment(config, logger): # logger 인자 추가
-    """
-    하나의 실험 세트(파일들 + 질문들)를 실행합니다.
-    """
-    print(f"\n{'='*20} Starting Experiment: {config['name']} {'='*20}")
+def main():
+    print("=== Long Context LLM Experiment Runner ===")
     
-    # 1. 초기화
-    model_mgr = ModelManager()
-    model_mgr.load_model()
-    
-    preprocessor = DocumentPreprocessor(max_tokens_per_chunk=1000)
-    indexer = GlobalIndexer()
-    orchestrator = LongContextOrchestrator(model_mgr)
+    # 1. 설정 로드
+    try:
+        sys_config = load_yaml("configs/experiment_config.yaml")
+        query_scenarios = load_yaml("configs/query_txt_config.yaml")
+    except Exception as e:
+        print(f"Error loading configs: {e}")
+        return
 
-    # 2. 모든 소스 파일 로드 및 통합
-    full_text = ""
-    for file_path in config['source_files']:
-        if not os.path.exists(file_path):
-            print(f"Warning: File not found - {file_path}")
+    # 2. 실험 시나리오 반복 수행
+    for exp in query_scenarios.get('experiments', []):
+        exp_name = exp.get('name', 'Unnamed Experiment')
+        print(f"\n[Experiment] Starting: {exp_name}")
+
+        # 소스 파일들의 텍스트 통합
+        combined_text = ""
+        source_names = []
+        for file_path in exp.get('source_files', []):
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    combined_text += f.read() + "\n\n---\n\n"
+                source_names.append(os.path.basename(file_path))
+            else:
+                print(f"  [Warning] File not found: {file_path}")
+
+        if not combined_text:
+            print(f"  [Skip] No valid source content found for {exp_name}")
             continue
-        with open(file_path, "r", encoding="utf-8") as f:
-            full_text += f.read() + "\n\n"
 
-    if not full_text.strip():
-        print("Error: No content to process.")
-        return
-
-    chunks = preprocessor.chunk_text(full_text, config['name'])
-    print(f"Total processed chunks: {len(chunks)}")
-    structural_map = indexer.build_structural_map(chunks)
-
-    # 3. 쿼리 반복 실행
-    for query in config['queries']:
-        print(f"\n[Running Query] {query}")
+        # 오케스트레이터 설정 (시스템 설정 + 실험 이름 주입)
+        current_config = sys_config.copy()
+        current_config['experiment_name'] = exp_name
         
-        # 지연 시간 측정을 위해 시작 시간 기록
-        start_time = time.time()
+        orchestrator = WorkflowOrchestrator(current_config)
         
-        answer = orchestrator.process_query(query, chunks, structural_map)
-        
-        # 로거를 통한 결과 기록
-        logger.log_result(
-            exp_name=config['name'],
-            query=query,
-            answer=answer,
-            start_time=start_time,
-            files=config['source_files']
-        )
-        
-        print("\n" + "-"*30)
-        print(f"[Result for: {config['name']}]")
-        print(answer)
-        print("-" * 30)
-        print(f"✅ Result logged to CSV.")
+        # 3. 쿼리 실행
+        file_label = ", ".join(source_names)
+        for query in exp.get('queries', []):
+            print(f"  [Query] Processing: {query[:50]}...")
+            try:
+                # 하이브리드 파이프라인 실행
+                answer = orchestrator.run_pipeline(
+                    raw_text=combined_text,
+                    query=query,
+                    file_name=file_label
+                )
+                # 결과는 Orchestrator 내부에서 Logger를 통해 CSV에 기록됨
+            except Exception as e:
+                print(f"  [Error] Failed to process query: {e}")
 
-def main(config_path : str):
-    
-    if not os.path.exists(config_path):
-        print(f"Error: Config file {config_path} not found.")
-        return
-
-    # 실험 전체를 관리할 로거 인스턴스 생성
-    logger = ExperimentLogger()
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_data = yaml.safe_load(f)
-
-    # 모든 실험 세트 순회
-    for exp_config in config_data.get('experiments', []):
-        run_experiment(exp_config, logger) # logger 전달
+    print("\n=== All experiments completed. Check the results folder. ===")
 
 if __name__ == "__main__":
-    main(config_path="configs/experiment_config_txt.yaml")
+    main()
