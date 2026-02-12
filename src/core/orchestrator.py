@@ -4,198 +4,208 @@ import pickle
 import yaml
 import numpy as np
 import concurrent.futures
-import multiprocessing
-from typing import List, Dict, Any, Tuple
-
+import regex as re
+from typing import List, Dict, Any, Tuple, Optional
 import torch
-from tqdm import tqdm
 from sentence_transformers import util
+from tqdm import tqdm
 
-from src.api.client import MistralAPIClient
-from src.data_loader.preprocessor import FastLongContextPreprocessor
+from src.data_loader.preprocessor import AdaptiveFastPreprocessor
 from src.utils.logger import ExperimentLogger
 
 class WorkflowOrchestrator:
     """
-    Planner-Navigator-Executor 구조를 가진 에이전트형 오케스트레이터입니다.
-    대규모 문서의 임베딩 캐싱 및 병렬 처리를 통해 성능을 최적화합니다.
+    전체 LLM 파이프라인의 워크플로우를 조율하는 핵심 모듈입니다.
+    Planner - Navigator - Executor(Synthesis)의 3단계 전략을 수행하며,
+    대규모 문서 처리를 위한 토큰 최적화 로직이 포함되어 있습니다.
     """
     def __init__(self, config: Dict[str, Any]):
+        """
+        Args:
+            config: 실험 설정 (data, strategy, logging 관련 파라미터 포함)
+        """
         self.config = config
+        
+        # 순환 참조 방지를 위해 내부 임포트 사용
+        from src.api.client import MistralAPIClient
         self.client = MistralAPIClient()
         
-        # 1. 프롬프트 YAML 로드
-        self.prompts = self._load_yaml_prompts("configs/prompts.yaml")
+        # 프롬프트 설정 로드
+        self.prompts = self._load_yaml("configs/prompts.yaml")
         
-        # 2. 전처리기 설정
+        # 1. 전처리기 초기화
         data_cfg = config.get('data', {})
-        self.preprocessor = FastLongContextPreprocessor(
-            max_tokens=data_cfg.get('chunk_size', 5000),
-            overlap=data_cfg.get('overlap', 1000)
+        self.preprocessor = AdaptiveFastPreprocessor(
+            self.client, 
+            self.prompts, 
+            max_tokens=data_cfg.get('chunk_size', 3000),
+            overlap=data_cfg.get('overlap', 300)
         )
+        
+        # 2. 로거 및 메타 정보 설정
+        log_cfg = config.get('logging', {})
+        self.logger = ExperimentLogger(base_path=log_cfg.get('base_path', 'results'))
+        self.exp_name = config.get('experiment_name', 'v3_adaptive_packing')
 
-        # 3. 임베딩 및 전략 설정
-        self.batch_size = data_cfg.get('batch_size', 128)
-        self.logger = ExperimentLogger()
-        self.exp_name = config.get('experiment_name', 'agentic_long_context_v1')
-        
+        # 3. 검색 및 합성 전략 파라미터
         strat_cfg = config.get('strategy', {})
-        self.landmark_top_n = strat_cfg.get('scan_top_n', 40)
-        self.evidence_top_k = strat_cfg.get('final_top_k', 10)
+        self.landmark_top_n = strat_cfg.get('scan_top_n', 80)
+        self.evidence_top_k = strat_cfg.get('final_top_k', 32)
         
-        # 4. 캐시 경로 설정
+        # [중요] 토큰 폭발 방지를 위한 가드레일: 원문(Raw Detail)은 상위 N개만 포함
+        self.max_raw_details = 8 
+        
         self.cache_dir = "data/cache"
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    def _load_yaml_prompts(self, path: str) -> Dict[str, Any]:
-        """YAML 설정 파일에서 프롬프트 템플릿을 로드합니다."""
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"프롬프트 설정 파일을 찾을 수 없습니다: {path}")
+    def _load_yaml(self, path: str) -> Dict[str, Any]:
+        """YAML 설정 파일을 로드합니다."""
         with open(path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
 
     def _get_cache_path(self, file_name: str) -> str:
-        """파일명 기반 안전한 캐시 경로 생성"""
+        """캐싱을 위한 안전한 파일 경로를 생성합니다."""
         safe_name = "".join([c if c.isalnum() else "_" for c in file_name])
-        return os.path.join(self.cache_dir, f"{safe_name}_v2.pkl")
+        return os.path.join(self.cache_dir, f"{safe_name}_v3.pkl")
 
     def _get_embeddings(self, chunks: List[Dict[str, Any]], file_name: str) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-        """
-        임베딩 생성 가속 및 로컬 디스크 캐싱 로직.
-        반환 타입: tuple(임베딩 배열, 청크 리스트)
-        """
+        """임베딩을 생성하거나 로컬 캐시에서 불러옵니다."""
         cache_path = self._get_cache_path(file_name)
         
-        # 1. 로컬 캐시 확인
         if os.path.exists(cache_path):
-            print(f"[*] 로컬 캐시 발견: {cache_path} 로드 중...")
-            try:
-                with open(cache_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                    return cached_data["embeddings"], cached_data["chunks"]
-            except Exception as e:
-                print(f"[!] 캐시 로드 실패, 재생성합니다: {e}")
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
+                return data["embeddings"], data["chunks"]
 
-        # 2. 임베딩 생성 시작
-        print(f"[*] 인베딩 생성 중: {len(chunks)} 청크 분석...")
-        chunk_contents = [c['content'] for c in chunks]
+        print(f"[*] 임베딩 생성 중... ({len(chunks)} 청크)")
+        texts = [c['content'] for c in chunks]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        # SentenceTransformer를 이용한 벡터화 (Batch 처리)
+        embeddings = self.client.st_model.encode(
+            texts, 
+            batch_size=self.config.get('data', {}).get('batch_size', 256), 
+            show_progress_bar=True, 
+            device=device
+        )
         
-        if device == "cpu":
-            print(f"[*] CPU 멀티프로세스 가속 모드 가동 (Workers: {multiprocessing.cpu_count()-1})")
-            pool = self.client.st_model.start_multi_process_pool()
-            emb_np = self.client.st_model.encode_multi_process(
-                chunk_contents, pool, batch_size=self.batch_size
-            )
-            self.client.st_model.stop_multi_process_pool(pool)
-        else:
-            print(f"[*] 가속 장치 가동: {device}")
-            embeddings = self.client.st_model.encode(
-                chunk_contents, 
-                convert_to_tensor=True, 
-                show_progress_bar=True,
-                batch_size=self.batch_size,
-                device=device
-            )
-            emb_np = embeddings.cpu().numpy()
-
-        # 3. 결과 캐싱
         with open(cache_path, "wb") as f:
-            pickle.dump({"embeddings": emb_np, "chunks": chunks}, f)
-        
-        return emb_np, chunks
-
-    def _create_search_plan(self, query: str) -> str:
-        """Step 1: Planner - 질문 분석 및 탐색 전략 수립"""
-        template = self.prompts['planner']['user']
-        system_msg = self.prompts['planner']['system']
-        
-        return self.client.chat_completion([
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": template.format(query=query)}
-        ], temperature=0.0)
-
-    def _scout_location(self, chunk: Dict[str, Any], plan: str, query: str) -> Dict[str, Any]:
-        """Step 2: Navigator - 개별 청크의 가치 평가 및 증거 추출"""
-        template = self.prompts['navigator']['user']
-        system_msg = self.prompts['navigator']['system']
-        
-        content = chunk['content'][:3500]  # 컨텍스트 길이 최적화
-        
-        response = self.client.chat_completion([
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": template.format(plan=plan, query=query, content=content)}
-        ], temperature=0.0, max_tokens=300)
-        
-        score = 5
-        if "VALUE_SCORE:" in response:
-            try:
-                score_part = response.split("VALUE_SCORE:")[1].split("\n")[0]
-                score = int(''.join(filter(str.isdigit, score_part)))
-            except: pass
+            pickle.dump({"embeddings": embeddings, "chunks": chunks}, f)
             
-        return {
-            "score": score, 
-            "findings": response, 
-            "content": chunk['content'], 
-            "metadata": chunk['metadata']
-        }
+        return embeddings, chunks
 
-    def _execute_synthesis(self, query: str, plan: str, top_findings: List[Dict[str, Any]]) -> str:
-        """Step 3: Executor - 수집된 증거를 종합하여 최종 답변 작성"""
-        template = self.prompts['synthesis']['user']
-        system_msg = self.prompts['synthesis']['system']
+    def _create_dynamic_plan(self, query: str) -> Tuple[int, str]:
+        """Planner를 통해 탐색 범위(TOP_N)와 전략적 계획을 수립합니다."""
+        response = self.client.chat_completion([
+            {"role": "system", "content": self.prompts['planner']['system']},
+            {"role": "user", "content": self.prompts['planner']['user'].format(query=query)}
+        ], temperature=0.0)
         
-        evidence_str = ""
-        for i, f in enumerate(top_findings):
-            loc = " > ".join(f['metadata'].get('hierarchy', ['Root']))
-            evidence_str += f"<SOURCE index='{i+1}' location='{loc}'>\n{f['content']}\n</SOURCE>\n\n"
-
-        return self.client.chat_completion([
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": template.format(query=query, plan=plan, evidence=evidence_str)}
-        ], max_tokens=2500)
+        top_n = self.landmark_top_n
+        if "TOP_N:" in response:
+            try:
+                # 정규표현식을 사용하여 숫자 추출
+                top_n = int(re.search(r'\d+', response.split("TOP_N:")[1]).group())
+            except Exception:
+                pass
+        return top_n, response.strip()
 
     def run_pipeline(self, raw_text: str, query: str, file_name: str) -> str:
-        """에이전트 파이프라인 통합 실행 메인 메서드"""
+        """전체 RAG 파이프라인을 실행합니다."""
         start_time = time.time()
         
-        # 1. 캐시 확인 및 전처리
-        cache_path = self._get_cache_path(file_name)
-        if os.path.exists(cache_path):
-            chunks = []  # 임베딩 함수 내에서 캐시 로드됨
-        else:
-            chunks = self.preprocessor.preprocess(raw_text, {"file_name": file_name})
-        
-        # 2. 임베딩 가속 로드
-        embeddings, chunks = self._get_embeddings(chunks, file_name)
-        
-        # 3. 에이전트 플래닝
-        plan = self._create_search_plan(query)
-        print(f"[*] 탐색 계획 수립 완료: {plan[:80]}...")
-        
-        # 4. 후보군 선별 (Cosine Similarity)
-        query_emb = self.client.st_model.encode(query, convert_to_tensor=True)
-        scores = util.cos_sim(query_emb, embeddings)[0].cpu().numpy()
-        
-        top_indices = np.argsort(-scores)[:self.landmark_top_n]
-        scout_indices = sorted(list(set(top_indices) | {0, len(chunks) - 1}))
-        
-        # 5. 에이전트 내비게이션 (Parallel Scouting)
-        scout_results = []
-        print(f"[*] {len(scout_indices)}개 위치에 대한 에이전트 스카우팅 개시...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            future_to_idx = {
-                executor.submit(self._scout_location, chunks[idx], plan, query): idx 
-                for idx in scout_indices
-            }
-            for future in tqdm(concurrent.futures.as_completed(future_to_idx), total=len(scout_indices), desc="Scouting"):
-                scout_results.append(future.result())
+        try:
+            # 1. 문서 스타일 분석 및 전처리
+            # 캐시가 있으면 임베딩 함수에서 처리하므로 전처리는 스킵 가능
+            cache_path = self._get_cache_path(file_name)
+            if not os.path.exists(cache_path):
+                chunks = self.preprocessor.preprocess(raw_text, {"file": file_name})
+            else:
+                chunks = [] # 캐시 로드 대기
 
-        # 6. 증거 기반 최종 합성
-        top_findings = sorted(scout_results, key=lambda x: x['score'], reverse=True)[:self.evidence_top_k]
-        final_answer = self._execute_synthesis(query, plan, top_findings)
-        
-        self.logger.log_result(self.exp_name, query, final_answer, start_time, [file_name])
-        return final_answer
+            # 2. 임베딩 데이터 획득 및 플래닝
+            embeddings, chunks = self._get_embeddings(chunks, file_name)
+            dynamic_k, plan = self._create_dynamic_plan(query)
+            print(f"[*] 동적 탐색 계획 수립: {dynamic_k}개 지점 정밀 분석 예정")
+
+            # 3. 벡터 유사도 기반 후보군(Landmarks) 선정
+            query_emb = self.client.st_model.encode(query, convert_to_tensor=True)
+            scores = util.cos_sim(query_emb, torch.from_numpy(embeddings))[0].cpu().numpy()
+            
+            # 상위 K개 및 문서 시작/끝 지점 추가 (맥락 파악용)
+            top_indices = np.argsort(-scores)[:dynamic_k]
+            terminals = set(range(0, min(5, len(chunks)))) | set(range(max(0, len(chunks)-5), len(chunks)))
+            scout_indices = sorted(list(set(top_indices) | terminals))
+
+            # 4. 에이전트 스카우팅 (Navigator Phase)
+            scout_reports = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                future_to_idx = {}
+                for idx in scout_indices:
+                    chunk = chunks[idx]
+                    pos_info = f"{(idx/len(chunks))*100:.1f}% 지점"
+                    
+                    f = executor.submit(self.client.chat_completion, [
+                        {"role": "system", "content": self.prompts['navigator']['system']},
+                        {"role": "user", "content": self.prompts['navigator']['user'].format(
+                            plan=plan, 
+                            query=query, 
+                            content=chunk['content'][:3500],
+                            position_info=pos_info, 
+                            chunk_index=idx, 
+                            total_chunks=len(chunks)
+                        )}
+                    ], temperature=0.0)
+                    future_to_idx[f] = idx
+                
+                for f in tqdm(concurrent.futures.as_completed(future_to_idx), total=len(scout_indices), desc="Scouting"):
+                    report_text = f.result()
+                    idx = future_to_idx[f]
+                    
+                    # 보고서에서 VALUE_SCORE 추출
+                    score = 5
+                    if "VALUE_SCORE:" in report_text:
+                        try:
+                            score = int(re.search(r'\d+', report_text.split("VALUE_SCORE:")[1]).group())
+                        except:
+                            pass
+                    
+                    scout_reports.append({
+                        "score": score,
+                        "findings": report_text,
+                        "raw_content": chunks[idx]['content'],
+                        "pos": f"{(idx/len(chunks))*100:.1f}%"
+                    })
+
+            # 5. Adaptive Evidence Packing (Context Length 최적화 핵심)
+            # 가치 점수가 높은 순으로 정렬하여 상위 TOP_K 선별
+            sorted_reports = sorted(scout_reports, key=lambda x: x['score'], reverse=True)[:self.evidence_top_k]
+            
+            packed_evidence = ""
+            for i, rep in enumerate(sorted_reports):
+                # 모든 결과에 대해 Navigator의 분석 요약(FINDINGS)은 포함 (가볍고 핵심적)
+                packed_evidence += f"\n[Evidence {i+1} at {rep['pos']} - Score: {rep['score']}]\n{rep['findings']}\n"
+                
+                # 상위 8개(max_raw_details)에 한해서만 모델이 직접 대조할 '상세 원문' 포함
+                if i < self.max_raw_details:
+                    packed_evidence += f"Detailed Excerpt: {rep['raw_content'][:1500]}\n"
+
+            # 6. 최종 답변 합성 (Executor Phase)
+            final_answer = self.client.chat_completion([
+                {"role": "system", "content": self.prompts['synthesis']['system']},
+                {"role": "user", "content": self.prompts['synthesis']['user'].format(
+                    query=query, 
+                    plan=plan, 
+                    evidence=packed_evidence
+                )}
+            ])
+
+            # 7. 결과 로깅 및 반환
+            self.logger.log_result(self.exp_name, query, final_answer, start_time, [file_name])
+            return final_answer
+
+        except Exception as e:
+            error_msg = f"Pipeline Error: {str(e)}"
+            self.logger.log_result(self.exp_name, query, error_msg, start_time, [file_name])
+            print(f"[!] 파이프라인 에러 발생: {e}")
+            return error_msg

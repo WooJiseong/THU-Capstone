@@ -1,90 +1,100 @@
 import re
-from typing import List, Dict, Any, Optional
-from abc import ABC, abstractmethod
+import json
+import multiprocessing
+import concurrent.futures
+from typing import List, Dict, Any
+from tqdm import tqdm
 
-class BasePreprocessor(ABC):
-    @abstractmethod
-    def preprocess(self, raw_text: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        pass
-
-class GeneralMarkdownPreprocessor(BasePreprocessor):
-    """
-    고성능 노이즈 필터링 및 토큰 최적화 전처리기입니다.
-    의미 없는 공백을 제거하고 구조를 보존하며 청킹합니다.
-    """
-    def __init__(self, max_tokens: int = 6000, overlap: int = 1000):
-        # 1토큰 ~= 4자 기준
+class AdaptiveFastPreprocessor:
+    def __init__(self, api_client, prompt_config: Dict[str, Any], max_tokens: int = 3000, overlap: int = 500):
+        self.client = api_client
+        self.prompts = prompt_config
         self.max_chars = max_tokens * 4
-        self.overlap = overlap
-        self.header_pattern = re.compile(r'^#+\s')
+        self.overlap_chars = overlap * 4
+        self.num_workers = max(1, multiprocessing.cpu_count() - 1)
 
-    def _clean_content(self, text: str) -> str:
-        """
-        토큰 절약을 위한 텍스트 정제 로직:
-        1. 연속된 줄바꿈을 2개로 압축
-        2. 라인 끝의 불필요한 공백 제거
-        3. 너무 짧거나 의미 없는 라인(예: 단독 특수문자) 필터링
-        """
-        # 줄바꿈 압축
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        lines = text.split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            stripped = line.strip()
-            # 너무 짧은 노이즈 라인 필터링 (단, 헤더나 구분자는 유지)
-            if len(stripped) < 2 and stripped not in ['#', '-', '*', '|']:
-                continue
-            cleaned_lines.append(stripped)
-            
-        return '\n'.join(cleaned_lines)
+    def _analyze_style(self, text: str) -> Dict[str, Any]:
+        """문서 샘플 분석을 통한 전략 수립"""
+        samples = [text[:4000], text[len(text)//2:len(text)//2+4000], text[-4000:]]
+        sample_text = "\n--- SAMPLE ---\n".join(samples)
+
+        try:
+            response = self.client.chat_completion(
+                messages=[
+                    {"role": "system", "content": self.prompts['style_analyzer']['system']},
+                    {"role": "user", "content": self.prompts['style_analyzer']['user'].format(samples=sample_text)}
+                ],
+                response_format={"type": "json_object"} # [핵심] JSON 모드 명시
+            )
+            return json.loads(response)
+        except Exception as e:
+            print(f"[!] 스타일 분석 실패(기본값 사용): {e}")
+            return {"primary_header_pattern": r'^(#{1,6})\s+(.+)$', "chunk_size_multiplier": 1.0}
 
     def preprocess(self, raw_text: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        cleaned_text = self._clean_content(raw_text)
-        paragraphs = cleaned_text.split('\n\n')
+        style_guide = self._analyze_style(raw_text)
+        pattern = style_guide.get('primary_header_pattern', r'^(#{1,6})\s+(.+)$')
         
+        # 1. 섹션 분할 (정규표현식 기반)
+        try:
+            header_regex = re.compile(pattern, re.MULTILINE)
+        except:
+            header_regex = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
+            
+        matches = list(header_regex.finditer(raw_text))
+        sections = []
+        if not matches:
+            sections = [{"title": "Full Document", "content": raw_text, "hierarchy": ["Root"]}]
+        else:
+            for i, m in enumerate(matches):
+                start = m.start()
+                end = matches[i+1].start() if i+1 < len(matches) else len(raw_text)
+                sections.append({
+                    "title": m.group(0)[:100].strip(),
+                    "content": raw_text[start:end],
+                    "hierarchy": [m.group(0).strip()]
+                })
+
+        # 2. 병렬 청킹 (가드레일: 섹션이 너무 크면 강제 분할)
+        all_chunks = []
+        # 토큰 설정값 반영
+        current_limit = int(self.max_chars * style_guide.get('chunk_size_multiplier', 1.0))
+        current_overlap = int(self.overlap_chars * style_guide.get('chunk_size_multiplier', 1.0))
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(self._chunk_task, s, metadata, current_limit, current_overlap) for s in sections]
+            for f in tqdm(concurrent.futures.as_completed(futures), total=len(sections), desc="Adaptive Chunking"):
+                all_chunks.extend(f.result())
+        
+        return all_chunks
+
+    @staticmethod
+    def _chunk_task(section: Dict[str, Any], meta: Dict[str, Any], limit: int, overlap: int) -> List[Dict[str, Any]]:
+        """물리적 한계를 넘지 않도록 보장하는 청킹 워커"""
+        content = section['content']
         chunks = []
-        current_chunk = []
-        current_length = 0
+        start = 0
         
-        for p in paragraphs:
-            p_len = len(p) + 2
+        while start < len(content):
+            end = start + limit
+            chunk_txt = content[start:end]
             
-            # 단일 단락이 너무 큰 경우 (강제 분할)
-            if p_len > self.max_chars:
-                if current_chunk:
-                    chunks.append(self._create_chunk('\n\n'.join(current_chunk), metadata))
-                    current_chunk = []
-                    current_length = 0
-                
-                # 거대 단락 분할
-                start = 0
-                while start < p_len:
-                    end = start + self.max_chars
-                    chunks.append(self._create_chunk(p[start:end], metadata))
-                    start += (self.max_chars - self.overlap)
-                continue
+            # 문장 경계 보존 시도
+            if end < len(content):
+                last_period = chunk_txt.rfind('. ')
+                if last_period != -1 and last_period > (limit // 2):
+                    actual_end = start + last_period + 1
+                    chunk_txt = content[start:actual_end]
+                else:
+                    actual_end = end
+            else:
+                actual_end = end
 
-            if current_length + p_len > self.max_chars:
-                chunks.append(self._create_chunk('\n\n'.join(current_chunk), metadata))
-                # Overlap: 이전 청크의 마지막 요소 일부 유지
-                current_chunk = current_chunk[-1:] if current_chunk else []
-                current_length = sum(len(x) + 2 for x in current_chunk)
-
-            current_chunk.append(p)
-            current_length += p_len
+            chunks.append({
+                "content": f"[Location: {section['title']}]\n{chunk_txt.strip()}",
+                "metadata": {**meta, "hierarchy": section['hierarchy'], "char_count": len(chunk_txt)}
+            })
             
-        if current_chunk:
-            chunks.append(self._create_chunk('\n\n'.join(current_chunk), metadata))
-            
+            start = actual_end - overlap
+            if actual_end >= len(content) or start >= len(content): break
         return chunks
-
-    def _create_chunk(self, content: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "content": content,
-            "metadata": {
-                **metadata,
-                "breadcrumbs": [line.strip('# ') for line in content.split('\n') if self.header_pattern.match(line)][-3:],
-                "char_count": len(content)
-            }
-        }

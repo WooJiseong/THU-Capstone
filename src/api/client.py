@@ -1,18 +1,19 @@
 import requests
 import time
 import os
+import json
 import numpy as np
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer, util
 
 class MistralAPIClient:
     """
-    적응형 Temperature 모델을 갖춘 Mistral API 클라이언트입니다.
+    JSON 모드 및 적응형 Temperature를 지원하는 Mistral API 클라이언트입니다.
     """
     def __init__(self, key_filename: str = "mistral_api.txt"):
         self._setup_key(key_filename)
         self.endpoint = "https://api.mistral.ai/v1/chat/completions"
-        self.model = "mistral-small-2506"
+        self.model = "mistral-small-2506" # 최신 모델 버전 확인 권장
         self.st_model = SentenceTransformer('all-MiniLM-L6-v2')
         
         self.factual_anchor = "Technical documentation analysis, extraction of facts, version numbers, dates, regulations, and objective evidence."
@@ -45,16 +46,18 @@ class MistralAPIClient:
         self, 
         messages: List[Dict[str, str]], 
         temperature: Optional[float] = None,
-        max_tokens: int = 4096
+        max_tokens: int = 4096,
+        response_format: Optional[Dict[str, Any]] = None # [수정] JSON 모드를 위한 파라미터 추가
     ) -> str:
         """
-        Mistral API 호출을 수행하며 항상 문자열(str) 반환을 보장합니다.
+        Mistral API 호출을 수행하며 JSON 모드를 지원합니다.
         """
         last_user_msg = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), "")
         final_temp = temperature if temperature is not None else self._calculate_dynamic_temperature(last_user_msg)
 
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
         
@@ -65,15 +68,27 @@ class MistralAPIClient:
             "max_tokens": max_tokens
         }
 
+        # [수정] response_format 주입 (예: {"type": "json_object"})
+        if response_format:
+            payload["response_format"] = response_format
+
         for i in range(3):
             try:
                 response = requests.post(self.endpoint, headers=headers, json=payload, timeout=90)
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-                return str(content) if content is not None else "Error: Received empty content from API."
+                
+                resp_json = response.json()
+                content = resp_json["choices"][0]["message"]["content"]
+                
+                return str(content) if content is not None else "Error: Received empty content."
+            
+            except requests.exceptions.HTTPError as e:
+                # 400 에러 등의 경우 상세 메시지 확인
+                error_msg = response.json().get('message', str(e))
+                if i == 2: return f"Error: API call failed. {error_msg}"
+                time.sleep(2 ** i)
             except Exception as e:
-                if i == 2:
-                    return f"Error: API call failed after retries. {str(e)}"
+                if i == 2: return f"Error: Unexpected failure. {str(e)}"
                 time.sleep(2 ** i)
         
         return "Error: Unexpected termination of API client loop."
