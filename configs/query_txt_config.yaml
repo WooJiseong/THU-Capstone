@@ -14,6 +14,14 @@ experiments:
       - "Summarize the requirements for high-risk AI systems."
       - "What are the prohibited AI practices according to Article 5?"
 
+  - name: "EU AI Act Analysis"
+    source_files:
+      - "data/AI_Act.pdf"
+    queries:
+      - "How many articles are there in the AI Act?"
+      - "Summarize the requirements for high-risk AI systems."
+      - "What are the prohibited AI practices according to Article 5?"
+
   - name: "EU National Parks File"
     source_files:
       - "data/nationalparks_europe.txt"

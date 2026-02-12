@@ -24,6 +24,8 @@ dependencies = [
     "pymupdf>=1.26.7",
     "sentence-transformers>=5.2.2",
     "faiss-gpu>=1.7.2",
+    "docling>=2.73.0",
+    "pypdf2>=3.0.1",
 ]
 
 [dependency-groups]

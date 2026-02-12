@@ -1,0 +1,24 @@
+# -------------------------------------------------------------------------
+# Long Context Document LLM Experiment Configuration (v4.0)
+# Optimized for: Parent-Child Architecture + Latency Balance
+# -------------------------------------------------------------------------
+
+data:
+  # Parent Chunk Size: LLM이 한 번에 읽을 맥락의 크기 (추론용)
+  chunk_size: 2500 
+  # Overlap: 부모 청크 간 중첩 (맥락 단절 방지)
+  overlap: 250
+  batch_size: 256
+
+strategy:
+  # scan_top_n: 자식 청크 검색 결과 중 Navigator가 정밀 조사할 개수
+  # 500토큰 단위의 자식 청크이므로 100~120개면 충분한 커버리지를 가짐
+  scan_top_n: 100 
+  
+  # final_top_k: Navigator가 선별한 증거 중 Synthesis에 전달할 개수
+  # 2500토큰 부모 맥락을 사용하므로 24~32개면 131k 컨텍스트 내에서 안전함
+  final_top_k: 24 
+
+logging:
+  # 결과 저장 경로를 버전별로 관리하여 분석 용이성 확보
+  base_path: "results/exp_v4_parent_child"

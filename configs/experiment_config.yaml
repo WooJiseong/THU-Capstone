@@ -1,11 +1,21 @@
+# -------------------------------------------------------------------------
+# Long Context Document LLM Experiment Configuration (v3.4)
+# Optimized for: Single-level Adaptive Chunking + Performance
+# -------------------------------------------------------------------------
+
 data:
+  # Chunk Size: 3000 tokens (Standard single-level size)
   chunk_size: 2000
   overlap: 200
   batch_size: 256
 
 strategy:
-  scan_top_n: 160     # 청크가 작아졌으므로 더 많은 후보를 스캔
-  final_top_k: 32     # 더 많은 세부 증거 포함
+  # scan_top_n: Number of candidates to be scanned by Navigator
+  # Chunks are larger, so 80 is usually enough for a 4000p document.
+  scan_top_n: 160
+  
+  # final_top_k: Number of findings to be sent to Synthesis
+  final_top_k: 32 
 
 logging:
-  base_path: "results/exp02"
+  base_path: "results/exp_standard_v3"
